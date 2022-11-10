@@ -13,3 +13,8 @@ env_logger = "0.9.*"
 base64="0.13.*"
 trust-dns-proto = "0.22.*"
 rand = "*"
+
+[profile.release]
+lto = "fat"
+strip = "debuginfo"
+panic = "abort"
