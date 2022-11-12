@@ -2,9 +2,13 @@ use clap::Parser;
 use log::{info, warn};
 use std::{
     cmp::min,
+    collections::HashMap,
     io::Result,
-    net::{SocketAddr, ToSocketAddrs, UdpSocket},
+    net::{SocketAddr, ToSocketAddrs},
 };
+
+use tokio::net::UdpSocket;
+
 use trust_dns_proto::{
     op::{Message, Query},
     rr::{rdata::TXT, Name, RData, Record, RecordType},
@@ -20,68 +24,65 @@ struct Config {
     loglevel: Option<String>,
 }
 
-fn main() -> Result<()> {
+const BUF_SIZE: usize = 0x1000;
+const NAME_L: usize = 63;
+const TXT_L: usize = 255;
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let config = Config::parse();
 
     env_logger::builder()
         .parse_filters(&config.loglevel.unwrap_or("warn".to_string()))
         .init();
 
-    let listen = config.listen.to_socket_addrs()?.next().unwrap();
-    let dst = config.dst.to_socket_addrs()?.next().unwrap();
+    let dst = config.dst.to_socket_addrs().unwrap().next().unwrap();
 
-    let usock = UdpSocket::bind(listen)?;
+    let usock = UdpSocket::bind(config.listen).await?;
 
     warn!("listening on {}", usock.local_addr()?);
 
-    if config.client {
-        client(usock, dst)
-    } else {
-        server(usock, dst)
+    let mut buf = vec![0_u8; BUF_SIZE];
+
+    let (mut table_send, mut table_recv) = (HashMap::new(), HashMap::new());
+
+    loop {
+        let (received, from) = usock.recv_from(&mut buf).await?;
+
+        if let Some(to) = table_send.get(&from) {
+            info!("{} bytes received from {}", received, from);
+
+            usock.send_to(&buf[..received], to).await?;
+        } else if from.ip().is_loopback() && table_recv.contains_key(&from.port()) {
+            usock
+                .send_to(&buf[..received], table_recv.get(&from.port()).unwrap())
+                .await?;
+        } else {
+            info!("new connection. {} bytes received from {}", received, from);
+
+            let ssock = UdpSocket::bind("0.0.0.0:0").await?;
+
+            table_send.insert(from, ssock.local_addr().unwrap());
+            table_recv.insert(ssock.local_addr().unwrap().port(), from);
+
+            if config.client {
+                tokio::spawn(client(ssock, usock.local_addr().unwrap(), dst));
+            } else {
+                tokio::spawn(server(ssock, usock.local_addr().unwrap(), dst));
+            }
+
+            usock.send_to(&buf[..received], table_send[&from]).await?;
+        }
     }
 }
 
-const NAME_L: usize = 63;
-
-fn client(usock: UdpSocket, dst: SocketAddr) -> Result<()> {
-    let mut buf = vec![0_u8; 0x1000];
-    let mut src = None;
+async fn client(usock: UdpSocket, host: SocketAddr, dst: SocketAddr) -> Result<()> {
+    let mut buf = vec![0_u8; BUF_SIZE];
 
     loop {
-        let (received, from) = usock.recv_from(&mut buf)?;
+        let (received, from) = usock.recv_from(&mut buf).await?;
 
-        info!("{} bytes received from {}", received, from);
-
-        if from == dst {
-            if let Some(to) = src {
-                match Message::from_vec(&buf[..received]) {
-                    Ok(msg) => {
-                        let mut s = String::new();
-
-                        msg.answers().iter().for_each(|rec| {
-                            s += &rec.data().unwrap().as_txt().unwrap().to_string();
-                        });
-                        match base64::decode_config(s, base64::URL_SAFE_NO_PAD) {
-                            Ok(b) => {
-                                info!("forwarding to {}", to);
-                                usock.send_to(&b, to)?;
-                            }
-                            Err(err) => {
-                                warn!("{}", err);
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!("{}", err);
-                    }
-                };
-            } else {
-                warn!("ignored (cannot determine destination)");
-            }
-        } else {
-            src = Some(from);
-            info!("forwarding to {}", dst);
-
+        if from.ip().is_loopback() && from.port() == host.port() {
             let s = base64::encode_config(&buf[..received], base64::URL_SAFE_NO_PAD);
             let s = s.as_bytes();
 
@@ -94,52 +95,43 @@ fn client(usock: UdpSocket, dst: SocketAddr) -> Result<()> {
                     q
                 }));
 
-            usock.send_to(&msg.to_vec().unwrap(), dst)?;
+            info!("forwarding to {}", dst);
+
+            usock.send_to(&msg.to_vec().unwrap(), dst).await?;
+        } else if from == dst {
+            info!("{} bytes received from {}", received, from);
+
+            match Message::from_vec(&buf[..received]) {
+                Ok(msg) => {
+                    let mut s = String::new();
+
+                    msg.answers().iter().for_each(|rec| {
+                        s += &rec.data().unwrap().as_txt().unwrap().to_string();
+                    });
+                    match base64::decode_config(s, base64::URL_SAFE_NO_PAD) {
+                        Ok(b) => {
+                            usock.send_to(&b, host).await?;
+                        }
+                        Err(err) => {
+                            warn!("{}", err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!("{}", err);
+                }
+            };
         }
     }
 }
 
-const TXT_L: usize = 255;
-
-fn server(usock: UdpSocket, dst: SocketAddr) -> Result<()> {
-    let mut buf = vec![0_u8; 0x1000];
-    let mut src = None;
-
-    let mut q_id = vec![];
+async fn server(usock: UdpSocket, host: SocketAddr, dst: SocketAddr) -> Result<()> {
+    let mut buf = vec![0_u8; BUF_SIZE];
 
     loop {
-        let (received, from) = usock.recv_from(&mut buf)?;
+        let (received, from) = usock.recv_from(&mut buf).await?;
 
-        info!("{} bytes received from {}", received, from);
-
-        if from == dst {
-            if let Some(to) = src {
-                let s = base64::encode_config(&buf[..received], base64::URL_SAFE_NO_PAD);
-
-                let mut msg = Message::new();
-                msg.set_id(if q_id.len() < 50 {
-                    rand::random()
-                } else {
-                    q_id.pop().unwrap()
-                })
-                .add_answers((0..s.len()).step_by(TXT_L).map(|i| {
-                    let mut r = Record::new();
-                    r.set_record_type(RecordType::TXT)
-                        .set_data(Some(RData::TXT(TXT::new(vec![String::from(
-                            &s[i..min(i + TXT_L, s.len())],
-                        )]))));
-                    r
-                }));
-
-                info!("forwarding to {}", to);
-
-                usock.send_to(&msg.to_vec().unwrap(), to)?;
-            } else {
-                warn!("ignored (cannot determine destination)");
-            }
-        } else {
-            src = Some(from);
-
+        if from.ip().is_loopback() && from.port() == host.port() {
             match Message::from_vec(&buf[..received]) {
                 Ok(msg) => {
                     let mut s = String::new();
@@ -152,11 +144,7 @@ fn server(usock: UdpSocket, dst: SocketAddr) -> Result<()> {
                         Ok(s) => {
                             info!("forwarding to {}", dst);
 
-                            if q_id.len() < 500 {
-                                q_id.push(msg.id());
-                            }
-
-                            usock.send_to(&s, dst)?;
+                            usock.send_to(&s, dst).await?;
                         }
                         Err(err) => {
                             warn!("{}", err);
@@ -167,6 +155,23 @@ fn server(usock: UdpSocket, dst: SocketAddr) -> Result<()> {
                     warn!("{}", err);
                 }
             }
+        } else if from == dst {
+            info!("{} bytes received from {}", received, from);
+
+            let s = base64::encode_config(&buf[..received], base64::URL_SAFE_NO_PAD);
+
+            let mut msg = Message::new();
+            msg.set_id(rand::random())
+                .add_answers((0..s.len()).step_by(TXT_L).map(|i| {
+                    let mut r = Record::new();
+                    r.set_record_type(RecordType::TXT)
+                        .set_data(Some(RData::TXT(TXT::new(vec![String::from(
+                            &s[i..min(i + TXT_L, s.len())],
+                        )]))));
+                    r
+                }));
+
+            usock.send_to(&msg.to_vec().unwrap(), host).await?;
         }
     }
 }
