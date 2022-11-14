@@ -1,8 +1,24 @@
 use clap::Parser;
 use log::{info, warn};
-use std::{cmp::min, collections::HashMap, io::Result, net::ToSocketAddrs};
+use std::{
+    cmp::min,
+    collections::HashMap,
+    io::Result,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
+};
 
-use tokio::{net::UdpSocket, task::JoinHandle};
+use bytes::Bytes;
+
+use tokio::{
+    net::UdpSocket,
+    select,
+    sync::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        Mutex,
+    },
+};
 
 use trust_dns_proto::{
     op::Message,
@@ -13,10 +29,12 @@ use trust_dns_proto::{
 struct Config {
     listen: String,
     dst: String,
-    #[arg(long)]
+    #[arg(short, long)]
     client: bool,
-    #[arg(long)]
+    #[arg(short, long)]
     loglevel: Option<String>,
+    #[arg(short, long)]
+    timeout: Option<u64>,
 }
 
 const BUF_SIZE: usize = 0x1000;
@@ -38,64 +56,95 @@ async fn main() -> Result<()> {
 
     let mut buf = vec![0_u8; BUF_SIZE];
 
-    let (mut table_send, mut table_recv) = (HashMap::new(), HashMap::new());
+    let table = Arc::new(Mutex::new(HashMap::<
+        SocketAddr,
+        mpsc::UnboundedSender<Bytes>,
+    >::new()));
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<(SocketAddr, Bytes)>();
 
     loop {
-        let (received, from) = usock.recv_from(&mut buf).await?;
+        select! {
+            r = usock.recv_from(&mut buf) => {
+                let (received,from) = r?;
+                let mut tablel = table.lock().await;
 
-        if let Some(to) = table_send.get(&from) {
-            info!("{} bytes received from {}", received, from);
+                if let Some(relayer) = tablel.get(&from) {
+                    info!("{} bytes received from {}", received, from);
+                    relayer.send(Bytes::copy_from_slice(&buf[..received])).unwrap();
+                } else {
+                    info!("new connection. {} bytes received from {}", received, from);
 
-            usock.send_to(&buf[..received], to).await?;
-        } else if from.ip().is_loopback() && table_recv.contains_key(&from.port()) {
-            usock
-                .send_to(&buf[..received], table_recv.get(&from.port()).unwrap())
-                .await?;
-        } else {
-            info!("new connection. {} bytes received from {}", received, from);
+                    let (ttx, rx) = mpsc::unbounded_channel::<Bytes>();
+                    tablel.insert(from, ttx);
 
-            let ssock = UdpSocket::bind("0.0.0.0:0").await?;
+                    tokio::spawn(relay(config.client,config.timeout.unwrap_or_else(||60),tx.clone(),rx,from,dst,table.clone()));
 
-            table_send.insert(from, ssock.local_addr().unwrap());
-            table_recv.insert(ssock.local_addr().unwrap().port(), from);
-
-            let host = usock.local_addr().unwrap();
-
-            let _: JoinHandle<Result<()>> = tokio::spawn(async move {
-                let mut buf = vec![0_u8; BUF_SIZE];
-
-                loop {
-                    let (received, from) = ssock.recv_from(&mut buf).await?;
-
-                    if from.ip().is_loopback() && from.port() == host.port() {
-                        if let Some(msg) = if config.client {
-                            Some(dns_reply_encode(&buf[..received]))
-                        } else {
-                            dns_reply_decode(&buf[..received])
-                        } {
-                            info!("forwarding to {}", dst);
-                            ssock.send_to(&msg, dst).await?;
-                        }
-                    } else if from == dst {
-                        info!("{} bytes received from {}", received, from);
-
-                        if let Some(msg) = if config.client {
-                            dns_reply_decode(&buf[..received])
-                        } else {
-                            Some(dns_reply_encode(&buf[..received]))
-                        } {
-                            ssock.send_to(&msg, host).await?;
-                        }
-                    }
+                    tablel.get(&from).unwrap().send(Bytes::copy_from_slice(&buf[..received])).unwrap();
                 }
-            });
+            },
+            r = rx.recv() => {
+                let (to,buf) = r.unwrap();
 
-            usock.send_to(&buf[..received], table_send[&from]).await?;
-        }
+                info!("forwarding to {}",to);
+                usock.send_to(&buf,to).await?;
+            }
+        };
     }
 }
 
-fn dns_reply_encode(buf: &[u8]) -> Vec<u8> {
+async fn relay(
+    is_client: bool,
+    timeout: u64,
+
+    tx: UnboundedSender<(SocketAddr, Bytes)>,
+    mut rx: UnboundedReceiver<Bytes>,
+    src: SocketAddr,
+    dst: SocketAddr,
+    table: Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>,
+) -> Result<()> {
+    let mut buf = vec![0_u8; BUF_SIZE];
+
+    let usock = UdpSocket::bind("0.0.0.0:0").await?;
+
+    loop {
+        select! {
+            r = tokio::time::timeout(
+                Duration::from_secs(timeout),
+                usock.recv_from(&mut buf),
+            )=>{
+                let (received, from) = match r{
+                    Ok(r) => r?,
+                    Err(_) => {
+                        info!("timeout, stopping relay from {} to {}", src, dst);
+                        let mut tablel = table.lock().await;
+                        tablel.remove(&src);
+                        rx.close();
+                        return Ok(());
+                    }
+                };
+
+                if from == dst {
+                    info!("{} bytes received from {}", received, from);
+                    if let Some(msg) = if is_client {
+                        dns_reply_decode(&buf[..received])
+                    } else {
+                        Some(dns_reply_encode(&buf[..received]))
+                    } {
+                        tx.send((src,msg)).unwrap();
+                    }
+                };
+            },
+            r = rx.recv()=>{
+                info!("forwarding to {}",dst);
+                usock.send_to(&r.unwrap(),dst).await?;
+            }
+
+        };
+    }
+}
+
+fn dns_reply_encode(buf: &[u8]) -> Bytes {
     let s = base64::encode(buf);
 
     let mut msg = Message::new();
@@ -109,10 +158,10 @@ fn dns_reply_encode(buf: &[u8]) -> Vec<u8> {
             r
         }));
 
-    msg.to_vec().unwrap()
+    Bytes::from(msg.to_vec().unwrap())
 }
 
-fn dns_reply_decode(buf: &[u8]) -> Option<Vec<u8>> {
+fn dns_reply_decode(buf: &[u8]) -> Option<Bytes> {
     match Message::from_vec(&buf) {
         Ok(msg) => {
             let mut s = String::new();
@@ -121,7 +170,7 @@ fn dns_reply_decode(buf: &[u8]) -> Option<Vec<u8>> {
                 s += &rec.data().unwrap().as_txt().unwrap().to_string();
             });
             match base64::decode(s) {
-                Ok(b) => return Some(b),
+                Ok(b) => return Some(Bytes::from(b)),
                 Err(err) => {
                     warn!("{}", err);
                 }

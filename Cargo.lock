@@ -655,6 +655,7 @@ name = "udp2dns"
 version = "0.2.0"
 dependencies = [
  "base64",
+ "bytes",
  "clap",
  "env_logger",
  "log",
