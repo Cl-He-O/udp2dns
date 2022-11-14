@@ -116,7 +116,7 @@ async fn relay(
                 let (received, from) = match r{
                     Ok(r) => r?,
                     Err(_) => {
-                        info!("timeout, stopping relay from {} to {}", src, dst);
+                        info!("timeout, stopping relay for {}", src);
                         let mut tablel = table.lock().await;
                         tablel.remove(&src);
                         rx.close();
