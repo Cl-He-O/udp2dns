@@ -69,7 +69,10 @@ async fn main() -> Result<()> {
                 let (received,from) = r?;
                 let mut tablel = table.lock().await;
 
-                if let Some(relayer) = tablel.get(&from) {
+                if from == dst {
+                    info!("ignored connection from destination");
+                }
+                else if let Some(relayer) = tablel.get(&from) {
                     info!("{} bytes received from {}", received, from);
                     relayer.send(Bytes::copy_from_slice(&buf[..received])).unwrap();
                 } else {
