@@ -31,12 +31,15 @@ struct Config {
     dst: String,
     #[arg(short, long)]
     client: bool,
-    #[arg(short, long)]
-    loglevel: Option<String>, // default "warn"
-    #[arg(short, long)]
-    timeout: Option<u64>, // in seconds. Default 60
-    #[arg(short, long)]
-    bufsize: Option<usize>, // default 20
+    /// can be "debug", "info", or "warn"
+    #[arg(short, long, default_value_t = String::from("warn"))]
+    loglevel: String,
+    /// in seconds
+    #[arg(short, long, default_value_t = 60)]
+    timeout: u64,
+    /// send and receive queue size
+    #[arg(short, long, default_value_t = 20)]
+    bufsize: usize,
 }
 
 const BUF_SIZE: usize = 0x1000;
@@ -48,12 +51,9 @@ type Table = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 async fn main() -> Result<()> {
     let config = Config::parse();
 
-    env_logger::builder()
-        .parse_filters(&config.loglevel.unwrap_or("warn".to_string()))
-        .init();
+    env_logger::builder().parse_filters(&config.loglevel).init();
 
     let dst = config.dst.to_socket_addrs().unwrap().next().unwrap();
-    let cbufsize = config.bufsize.unwrap_or_else(|| 20);
 
     let usock = UdpSocket::bind(config.listen).await?;
 
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
 
     let table: Table = Arc::new(Mutex::new(HashMap::new()));
 
-    let (tx, mut rx) = mpsc::channel::<(SocketAddr, Bytes)>(cbufsize);
+    let (tx, mut rx) = mpsc::channel::<(SocketAddr, Bytes)>(config.bufsize);
 
     loop {
         select! {
@@ -81,10 +81,10 @@ async fn main() -> Result<()> {
                     info!("new connection from {}", from);
                     debug!("{} bytes received from {}", received, from);
 
-                    let (ttx, rx) = mpsc::channel::<Bytes>(cbufsize);
+                    let (ttx, rx) = mpsc::channel::<Bytes>(config.bufsize);
                     tablel.insert(from, ttx);
 
-                    tokio::spawn(relay(config.client,config.timeout.unwrap_or_else(||60),tx.clone(),rx,from,dst,table.clone()));
+                    tokio::spawn(relay(config.client,config.timeout,tx.clone(),rx,from,dst,table.clone()));
 
                     tablel.get(&from).unwrap().try_send(Bytes::copy_from_slice(&buf[..received])).ok();
                 }
