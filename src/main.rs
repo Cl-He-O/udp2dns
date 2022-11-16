@@ -1,12 +1,11 @@
 use clap::Parser;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::{
     cmp::min,
     collections::HashMap,
     io::Result,
     net::{SocketAddr, ToSocketAddrs},
     sync::Arc,
-    time::Duration,
 };
 
 use bytes::Bytes;
@@ -15,9 +14,10 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::{
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        mpsc::{self, Receiver, Sender},
         Mutex,
     },
+    time::{Duration, Instant},
 };
 
 use trust_dns_proto::{
@@ -32,13 +32,17 @@ struct Config {
     #[arg(short, long)]
     client: bool,
     #[arg(short, long)]
-    loglevel: Option<String>,
+    loglevel: Option<String>, // default "warn"
     #[arg(short, long)]
-    timeout: Option<u64>,
+    timeout: Option<u64>, // in seconds. Default 60
+    #[arg(short, long)]
+    bufsize: Option<usize>, // default 20
 }
 
 const BUF_SIZE: usize = 0x1000;
 const TXT_L: usize = 255;
+
+type Table = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,19 +53,17 @@ async fn main() -> Result<()> {
         .init();
 
     let dst = config.dst.to_socket_addrs().unwrap().next().unwrap();
+    let cbufsize = config.bufsize.unwrap_or_else(|| 20);
 
     let usock = UdpSocket::bind(config.listen).await?;
 
     warn!("listening on {}", usock.local_addr()?);
 
-    let mut buf = vec![0_u8; BUF_SIZE];
+    let mut buf = [0_u8; BUF_SIZE];
 
-    let table = Arc::new(Mutex::new(HashMap::<
-        SocketAddr,
-        mpsc::UnboundedSender<Bytes>,
-    >::new()));
+    let table: Table = Arc::new(Mutex::new(HashMap::new()));
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<(SocketAddr, Bytes)>();
+    let (tx, mut rx) = mpsc::channel::<(SocketAddr, Bytes)>(cbufsize);
 
     loop {
         select! {
@@ -73,23 +75,24 @@ async fn main() -> Result<()> {
                     info!("ignored connection from destination");
                 }
                 else if let Some(relayer) = tablel.get(&from) {
-                    info!("{} bytes received from {}", received, from);
-                    relayer.send(Bytes::copy_from_slice(&buf[..received])).unwrap();
+                    debug!("{} bytes received from {}", received, from);
+                    relayer.try_send(Bytes::copy_from_slice(&buf[..received])).ok();
                 } else {
-                    info!("new connection. {} bytes received from {}", received, from);
+                    info!("new connection from {}", from);
+                    debug!("{} bytes received from {}", received, from);
 
-                    let (ttx, rx) = mpsc::unbounded_channel::<Bytes>();
+                    let (ttx, rx) = mpsc::channel::<Bytes>(cbufsize);
                     tablel.insert(from, ttx);
 
                     tokio::spawn(relay(config.client,config.timeout.unwrap_or_else(||60),tx.clone(),rx,from,dst,table.clone()));
 
-                    tablel.get(&from).unwrap().send(Bytes::copy_from_slice(&buf[..received])).unwrap();
+                    tablel.get(&from).unwrap().try_send(Bytes::copy_from_slice(&buf[..received])).ok();
                 }
             },
             r = rx.recv() => {
                 let (to,buf) = r.unwrap();
 
-                info!("forwarding to {}",to);
+                debug!("forwarding to {}",to);
                 usock.send_to(&buf,to).await?;
             }
         };
@@ -100,20 +103,22 @@ async fn relay(
     is_client: bool,
     timeout: u64,
 
-    tx: UnboundedSender<(SocketAddr, Bytes)>,
-    mut rx: UnboundedReceiver<Bytes>,
+    tx: Sender<(SocketAddr, Bytes)>,
+    mut rx: Receiver<Bytes>,
     src: SocketAddr,
     dst: SocketAddr,
-    table: Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Bytes>>>>,
+    table: Table,
 ) -> Result<()> {
-    let mut buf = vec![0_u8; BUF_SIZE];
+    let mut buf = [0_u8; BUF_SIZE];
 
     let usock = UdpSocket::bind("0.0.0.0:0").await?;
 
+    let mut timer = Instant::now();
+
     loop {
         select! {
-            r = tokio::time::timeout(
-                Duration::from_secs(timeout),
+            r = tokio::time::timeout_at(
+                timer + Duration::from_secs(timeout),
                 usock.recv_from(&mut buf),
             )=>{
                 let (received, from) = match r{
@@ -128,19 +133,23 @@ async fn relay(
                 };
 
                 if from == dst {
-                    info!("{} bytes received from {}", received, from);
+                    debug!("{} bytes received from {}", received, from);
                     if let Some(msg) = if is_client {
                         dns_reply_decode(&buf[..received])
                     } else {
                         Some(dns_reply_encode(&buf[..received]))
                     } {
-                        tx.send((src,msg)).unwrap();
+                        tx.try_send((src,msg)).ok();
+
+                        timer = Instant::now();
                     }
                 };
             },
             r = rx.recv()=>{
-                info!("forwarding to {}",dst);
+                debug!("forwarding to {}",dst);
                 usock.send_to(&r.unwrap(),dst).await?;
+
+                timer = Instant::now();
             }
 
         };
